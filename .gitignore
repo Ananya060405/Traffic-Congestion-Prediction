@@ -1,0 +1,20 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Large processed dataset
+data/processed/multivariate_lstm_data.npz
+
+# Secrets
+.env
+
+# VS Code settings
+.vscode/
+
+# System files
+.DS_Store
+Thumbs.db
