@@ -1,636 +1,281 @@
-
-import streamlit as st
+from pathlib import Path
+from datetime import date
+import requests
 import numpy as np
 import pandas as pd
+import streamlit as st
 import tensorflow as tf
 import joblib
+import folium
+from streamlit_folium import st_folium
 
-from sklearn.metrics import (
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score
-)
+ROOT = Path(__file__).resolve().parent.parent
+DATA_FILE = ROOT / "data" / "processed" / "traffic_cleaned.csv"
+MODEL_DIR = ROOT / "models"
+NOMINATIM = "https://nominatim.openstreetmap.org/search"
+OSRM = "https://router.project-osrm.org/route/v1/driving"
 
-@st.cache_resource
-def load_models():
+st.set_page_config(page_title="IntelliRoute AI", page_icon="🚦", layout="wide")
 
-    # Load trained models
-    original_lstm = tf.keras.models.load_model(
-        "models/traffic_lstm.keras"
-    )
-
-    multivariate_lstm = tf.keras.models.load_model(
-        "models/traffic_multivariate_lstm.keras"
-    )
-
-    transformer = tf.keras.models.load_model(
-        "models/traffic_transformer.keras"
-    )
-
-    # Load test datasets
-    uni_data = np.load("data/processed/lstm_data.npz")
-    multi_data = np.load("data/processed/multivariate_lstm_data.npz")
-
-    # Load scalers
-    uni_scaler = joblib.load("models/traffic_scaler.pkl")
-
-    multi_scaler = joblib.load(
-        "models/multivariate_target_scaler.pkl"
-    )
-
-    return (
-        original_lstm,
-        multivariate_lstm,
-        transformer,
-        uni_data,
-        multi_data,
-        uni_scaler,
-        multi_scaler
-    )
-
-# Page configuration
-st.set_page_config(
-    page_title="Traffic Congestion Prediction",
-    page_icon="🚦",
-    layout="wide"
-)
-
-# Custom styling
 st.markdown("""
 <style>
-.main-title {
-    font-size: 36px;
-    font-weight: bold;
-    color: #1E88E5;
-}
-.subtitle {
-    color: gray;
-    font-size: 16px;
-}
+.block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+.hero {padding: 1.25rem 1.5rem; border-radius: 14px; background: linear-gradient(115deg,#10243a,#164e63); color: white; margin-bottom: 1rem;}
+.hero h1 {font-size: 2rem; margin: 0;}
+.hero p {margin: .4rem 0 0; color: #dbeafe;}
+.small-note {font-size: .85rem; color: #64748b;}
 </style>
 """, unsafe_allow_html=True)
 
-# Header
-st.markdown(
-    '<p class="main-title">🚦 Traffic Congestion Prediction System</p>',
-    unsafe_allow_html=True
-)
+@st.cache_data
+def load_traffic_data():
+    df = pd.read_csv(DATA_FILE)
+    df["date_time"] = pd.to_datetime(df["date_time"])
+    df = df.sort_values("date_time").reset_index(drop=True)
+    return df
 
-st.markdown(
-    '<p class="subtitle">AI-powered traffic volume prediction using Deep Learning</p>',
-    unsafe_allow_html=True
-)
+@st.cache_resource
+def load_models():
+    return {
+        "lstm": tf.keras.models.load_model(MODEL_DIR / "traffic_lstm.keras"),
+        "multi": tf.keras.models.load_model(MODEL_DIR / "traffic_multivariate_lstm.keras"),
+        "transformer": tf.keras.models.load_model(MODEL_DIR / "traffic_transformer.keras"),
+        "uni_scaler": joblib.load(MODEL_DIR / "traffic_scaler.pkl"),
+        "feature_scaler": joblib.load(MODEL_DIR / "multivariate_feature_scaler.pkl"),
+        "target_scaler": joblib.load(MODEL_DIR / "multivariate_target_scaler.pkl"),
+    }
 
-st.divider()
-
-# Sidebar
-st.sidebar.title("Navigation")
-
-page = st.sidebar.radio(
-    "Select a page",
-    ["Dashboard", "Traffic Prediction", "Model Comparison", "About Project"]
-)
-
-# Dashboard page
-if page == "Dashboard":
-
-    st.header("Traffic Overview")
-
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric("Dataset Records", "40,575")
-    col2.metric("Models Trained", "3")
-    col3.metric("Prediction Horizon", "Next 1 Hour")
-
-    st.divider()
-
-    st.subheader("Project Information")
-
-    st.write("""
-    This application uses deep learning models to predict
-    traffic volume based on historical traffic and weather data.
-
-    **Models available:**
-    - Original LSTM
-    - Multivariate LSTM
-    - Transformer
-    """)
-
-    st.info(
-        "Currently using historical Metro Interstate Traffic Volume data."
+@st.cache_data(ttl=3600)
+def geocode(place):
+    response = requests.get(
+        NOMINATIM,
+        params={"q": place, "format": "jsonv2", "limit": 1},
+        headers={"User-Agent": "IntelliRouteAI/1.0 educational-project"},
+        timeout=20,
     )
-    
-    
-    st.divider()
+    response.raise_for_status()
+    results = response.json()
+    if not results:
+        return None
+    item = results[0]
+    return {"name": item["display_name"], "lat": float(item["lat"]), "lon": float(item["lon"])}
 
-    st.subheader("📈 Historical Traffic Analysis")
+@st.cache_data(ttl=300)
+def get_routes(start_lon, start_lat, end_lon, end_lat):
+    coordinates = f"{start_lon},{start_lat};{end_lon},{end_lat}"
+    response = requests.get(
+        f"{OSRM}/{coordinates}",
+        params={"alternatives": "true", "steps": "true", "overview": "full", "geometries": "geojson"},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("code") != "Ok" or not payload.get("routes"):
+        raise ValueError("The routing service could not find a drivable route.")
+    return payload["routes"]
 
-    # Load cleaned historical dataset
-    try:
-        traffic_df = pd.read_csv(
-            "data/processed/traffic_cleaned.csv"
-        )
+def prepare_multivariate_features(df, feature_columns):
+    work = df.copy()
+    work["is_holiday"] = (work["holiday"].fillna("No Holiday") != "No Holiday").astype(int)
+    work["hour_sin"] = np.sin(2 * np.pi * work["date_time"].dt.hour / 24)
+    work["hour_cos"] = np.cos(2 * np.pi * work["date_time"].dt.hour / 24)
+    work["day_sin"] = np.sin(2 * np.pi * work["date_time"].dt.dayofweek / 7)
+    work["day_cos"] = np.cos(2 * np.pi * work["date_time"].dt.dayofweek / 7)
+    work["month_sin"] = np.sin(2 * np.pi * (work["date_time"].dt.month - 1) / 12)
+    work["month_cos"] = np.cos(2 * np.pi * (work["date_time"].dt.month - 1) / 12)
+    weather = pd.get_dummies(work["weather_main"], prefix="weather", dtype=int)
+    work = pd.concat([work, weather], axis=1)
+    for column in feature_columns:
+        if column not in work.columns:
+            work[column] = 0
+    return work[feature_columns].astype(float)
 
-        traffic_df["date_time"] = pd.to_datetime(
-            traffic_df["date_time"]
-        )
+def predict_historical_snapshot(df, selected_time, models):
+    positions = df.index[df["date_time"] == pd.Timestamp(selected_time)].tolist()
+    if not positions:
+        raise ValueError("No record exists for the selected date and time.")
+    end = positions[0] + 1
+    start = end - 24
+    if start < 0:
+        raise ValueError("There are not 24 earlier observations for this time.")
+    window = df.iloc[start:end].copy()
+    if not (window["date_time"].diff().dropna() == pd.Timedelta(hours=1)).all():
+        raise ValueError("The previous 24 records are not continuous hourly observations. Choose another time.")
 
-        # Select date range
-        min_date = traffic_df["date_time"].min().date()
-        max_date = traffic_df["date_time"].max().date()
+    uni_values = window["traffic_volume"].to_numpy(dtype=float).reshape(-1, 1)
+    uni_scaled = models["uni_scaler"].transform(uni_values).reshape(1, 24, 1)
+    lstm_scaled = models["lstm"].predict(uni_scaled, verbose=0).reshape(-1, 1)
+    lstm_value = float(models["uni_scaler"].inverse_transform(lstm_scaled)[0, 0])
 
-        start_date = st.date_input(
-            "Select starting date",
-            value=min_date,
-            min_value=min_date,
-            max_value=max_date
-        )
+    feature_columns = list(models["feature_scaler"].feature_names_in_)
+    all_features = prepare_multivariate_features(df, feature_columns)
+    multi_window = all_features.iloc[start:end].to_numpy(dtype=float)
+    multi_scaled = models["feature_scaler"].transform(multi_window).reshape(1, 24, len(feature_columns))
+    multi_model_value = float(models["target_scaler"].inverse_transform(
+        models["multi"].predict(multi_scaled, verbose=0).reshape(-1, 1)
+    )[0, 0])
+    transformer_value = float(models["target_scaler"].inverse_transform(
+        models["transformer"].predict(multi_scaled, verbose=0).reshape(-1, 1)
+    )[0, 0])
+    return {
+        "Original LSTM": max(0, lstm_value),
+        "Multivariate LSTM": max(0, multi_model_value),
+        "Transformer": max(0, transformer_value),
+        "observed": float(window["traffic_volume"].iloc[-1]),
+        "forecast_time": pd.Timestamp(selected_time) + pd.Timedelta(hours=1),
+    }
 
-        end_date = st.date_input(
-            "Select ending date",
-            value=max_date,
-            min_value=min_date,
-            max_value=max_date
-        )
+def congestion_label(value, thresholds):
+    q1, q2, q3 = thresholds
+    if value <= q1:
+        return "Low"
+    if value <= q2:
+        return "Moderate"
+    if value <= q3:
+        return "High"
+    return "Severe"
 
-        if start_date > end_date:
-            st.error("Starting date cannot be after ending date.")
+st.markdown("""
+<div class="hero">
+  <h1>🚦 IntelliRoute AI</h1>
+  <p>Interactive route planning, alternative-route comparison and historical AI traffic forecasting</p>
+</div>
+""", unsafe_allow_html=True)
 
+route_tab, forecast_tab, about_tab = st.tabs(["🗺️ Smart Route Planner", "🧠 AI Traffic Forecast", "ℹ️ About"])
+
+with route_tab:
+    st.subheader("Plan a journey")
+    left, right = st.columns(2)
+    with left:
+        origin_text = st.text_input("Starting point", placeholder="e.g. Mall of America, Bloomington, Minnesota")
+    with right:
+        destination_text = st.text_input("Destination", placeholder="e.g. Target Field, Minneapolis, Minnesota")
+    optimize = st.radio("Recommend route based on", ["Fastest journey", "Shortest distance"], horizontal=True)
+    plan = st.button("Find routes", type="primary", use_container_width=False)
+
+    if plan:
+        if not origin_text.strip() or not destination_text.strip():
+            st.warning("Enter both a starting point and a destination.")
         else:
-            filtered_df = traffic_df[
-                (traffic_df["date_time"].dt.date >= start_date) &
-                (traffic_df["date_time"].dt.date <= end_date)
-            ]
+            try:
+                with st.spinner("Finding locations and calculating alternative routes..."):
+                    origin = geocode(origin_text.strip())
+                    destination = geocode(destination_text.strip())
+                    if origin is None or destination is None:
+                        raise ValueError("Could not locate one of the places. Try adding the city and state.")
+                    routes = get_routes(origin["lon"], origin["lat"], destination["lon"], destination["lat"])
+                st.session_state["route_result"] = {
+                    "origin": origin, "destination": destination, "routes": routes,
+                    "optimize": optimize,
+                }
+            except Exception as exc:
+                st.error(f"Unable to calculate routes: {exc}")
 
-            if filtered_df.empty:
-                st.warning("No traffic records found for this date range.")
-
-            else:
-                # Traffic trend
-                st.subheader("Traffic Volume Over Time")
-
-                chart_df = filtered_df.set_index("date_time")[
-                    ["traffic_volume"]
-                ]
-
-                st.line_chart(chart_df)
-
-                # Summary metrics
-                col1, col2, col3 = st.columns(3)
-
-                col1.metric(
-                    "Average Traffic",
-                    f"{filtered_df['traffic_volume'].mean():.0f}"
-                )
-
-                col2.metric(
-                    "Maximum Traffic",
-                    f"{filtered_df['traffic_volume'].max():.0f}"
-                )
-
-                col3.metric(
-                    "Minimum Traffic",
-                    f"{filtered_df['traffic_volume'].min():.0f}"
-                )
-
-                st.subheader("Historical Data Preview")
-
-                st.dataframe(
-                    filtered_df[
-                        ["date_time", "traffic_volume", "temp",
-                         "rain_1h", "weather_main"]
-                    ].head(20),
-                    use_container_width=True
-                )
-
-    except FileNotFoundError:
-        st.error("Cleaned traffic dataset not found.")
-
-# Traffic Prediction page
-
-elif page == "Traffic Prediction":
-
-    st.header("Traffic Prediction")
-
-    st.write(
-        "Explore next-hour traffic predictions "
-        "using our trained deep learning models."
-    )
-
-    model_choice = st.selectbox(
-        "Choose Prediction Model",
-        [
-            "Original LSTM",
-            "Multivariate LSTM",
-            "Transformer"
+    result = st.session_state.get("route_result")
+    if result:
+        routes = result["routes"]
+        best_index = min(
+            range(len(routes)),
+            key=lambda i: routes[i]["duration"] if result["optimize"] == "Fastest journey" else routes[i]["distance"],
+        )
+        colors = ["#087f5b", "#2563eb", "#d97706", "#7c3aed"]
+        center = [
+            (result["origin"]["lat"] + result["destination"]["lat"]) / 2,
+            (result["origin"]["lon"] + result["destination"]["lon"]) / 2,
         ]
-    )
+        route_map = folium.Map(location=center, zoom_start=11, control_scale=True)
+        folium.Marker(
+            [result["origin"]["lat"], result["origin"]["lon"]],
+            tooltip="Start: " + result["origin"]["name"],
+            icon=folium.Icon(color="green", icon="play"),
+        ).add_to(route_map)
+        folium.Marker(
+            [result["destination"]["lat"], result["destination"]["lon"]],
+            tooltip="Destination: " + result["destination"]["name"],
+            icon=folium.Icon(color="red", icon="flag"),
+        ).add_to(route_map)
+        for i, route in enumerate(routes):
+            coords = route["geometry"]["coordinates"]
+            latlon = [[point[1], point[0]] for point in coords]
+            folium.PolyLine(
+                latlon, color=colors[i % len(colors)],
+                weight=7 if i == best_index else 4,
+                opacity=0.9 if i == best_index else 0.65,
+                tooltip=f"Route {i + 1}" + (" — recommended" if i == best_index else ""),
+            ).add_to(route_map)
+        st_folium(route_map, use_container_width=True, height=520, returned_objects=[])
 
-    if st.button("Generate Predictions"):
-
-        with st.spinner("Loading model and generating predictions..."):
-
-            (
-                original_lstm,
-                multivariate_lstm,
-                transformer,
-                uni_data,
-                multi_data,
-                uni_scaler,
-                multi_scaler
-            ) = load_models()
-
-            if model_choice == "Original LSTM":
-
-                model = original_lstm
-                X_test = uni_data["X_test"]
-                y_test = uni_data["y_test"]
-                scaler = uni_scaler
-                y_train_reference = uni_data["y_train"]
-
-            elif model_choice == "Multivariate LSTM":
-
-                model = multivariate_lstm
-                X_test = multi_data["X_test"]
-                y_test = multi_data["y_test"]
-                scaler = multi_scaler
-                y_train_reference = multi_data["y_train"]
-
-            else:
-
-                model = transformer
-                X_test = multi_data["X_test"]
-                y_test = multi_data["y_test"]
-                scaler = multi_scaler
-                y_train_reference = multi_data["y_train"]
-                
-            predictions = model.predict(
-                X_test,
-                verbose=0
-            )
-
-            actual = scaler.inverse_transform(
-                y_test.reshape(-1, 1)
-            ).flatten()
-
-            predicted = scaler.inverse_transform(
-                predictions.reshape(-1, 1)
-            ).flatten()
-            
-            
-# Calculate relative congestion thresholds from training data
-            training_traffic = scaler.inverse_transform(
-                y_train_reference.reshape(-1, 1)
-            ).flatten()
-
-            low_threshold, moderate_threshold, high_threshold = np.percentile(
-                training_traffic,
-                [25, 50, 75]
-            )
-
-# Classify predicted traffic volume
-            def classify_congestion(volume):
-
-                if volume <= low_threshold:
-                    return "Low"
-
-                elif volume <= moderate_threshold:
-                    return "Moderate"
-
-                elif volume <= high_threshold:
-                    return "High"
-
-                else:
-                    return "Severe"
-
-            congestion_levels = [
-                classify_congestion(value)
-                for value in predicted
-            ]
-
-
-            mae = mean_absolute_error(actual, predicted)
-
-            rmse = np.sqrt(
-                mean_squared_error(actual, predicted)
-            )
-
-            r2 = r2_score(actual, predicted)
-
-            st.success("Predictions generated successfully!")
-
-            # Display metrics
-            col1, col2, col3 = st.columns(3)
-
-            col1.metric("MAE", f"{mae:.2f}")
-            col2.metric("RMSE", f"{rmse:.2f}")
-            col3.metric("R² Score", f"{r2:.4f}")
-
-            st.divider()
-
-            # Display actual vs predicted graph
-            st.subheader("Actual vs Predicted Traffic Volume")
-
-            sample_count = min(300, len(actual))
-
-            chart_data = pd.DataFrame({
-                "Actual Traffic": actual[:sample_count],
-                "Predicted Traffic": predicted[:sample_count]
-            })
-
-            st.line_chart(chart_data)
-
-            # Display prediction table
-            st.subheader("Prediction Details")
-
-            result_data = pd.DataFrame({
-                "Actual Traffic": actual[:20],
-                "Predicted Traffic": predicted[:20],
-                "Congestion Level": congestion_levels[:20]
-            })
-
-            result_data["Prediction Error"] = (
-                result_data["Actual Traffic"]
-                - result_data["Predicted Traffic"]
-            )
-
-            st.dataframe(
-                result_data.round(2),
-                use_container_width=True
-            )
-
-# Display congestion distribution
-            st.subheader("Predicted Congestion Distribution")
-
-            congestion_counts = pd.Series(
-                congestion_levels
-            ).value_counts().reindex(
-                ["Low", "Moderate", "High", "Severe"],
-                fill_value=0
-            )
-
-            st.bar_chart(congestion_counts)
-
-            result_data["Prediction Error"] = (
-                result_data["Actual Traffic"]
-                - result_data["Predicted Traffic"]
-            )
-
-            st.dataframe(
-                result_data.round(2),
-                use_container_width=True
-            )
-            
-            # Download prediction results
-            report = pd.DataFrame({
-                "Actual Traffic Volume": actual,
-                "Predicted Traffic Volume": predicted,
-                "Congestion Level": congestion_levels,
-                "Prediction Error": actual - predicted
-            })
-
-            csv_data = report.to_csv(index=False).encode("utf-8")
-
-            st.download_button(
-                label="📥 Download Prediction Report",
-                data=csv_data,
-                file_name="traffic_prediction_report.csv",
-                mime="text/csv"
-            )
-
-
-    st.header("Traffic Prediction")
-
-    st.write(
-        "Select a trained model to explore its traffic predictions."
-    )
-
-    model_choice = st.selectbox(
-        "Choose Model",
-        ["Original LSTM", "Multivariate LSTM", "Transformer"]
-    )
-
-    st.write("Selected model:", model_choice)
-
-    st.info(
-        "We will connect the trained model and prediction interface in the next step."
-    )
-
-# Model Comparison page
-
-elif page == "Model Comparison":
-
-    st.header("Deep Learning Model Comparison")
-
-    st.write(
-        "Compare the performance of three deep learning "
-        "models trained for next-hour traffic prediction."
-    )
-
-    # Load comparison results
-    try:
-        comparison = pd.read_csv(
-            "models/three_model_comparison.csv"
+        st.subheader("Compare your route options")
+        st.caption("The routing service supplies road distance and baseline duration. These are not live-traffic ETAs.")
+        cards = st.columns(min(len(routes), 3))
+        for i, route in enumerate(routes):
+            with cards[i % len(cards)]:
+                st.markdown(f"**Route {i + 1}**")
+                if i == best_index:
+                    st.success("Recommended")
+                st.metric("Estimated driving time", f"{route['duration'] / 60:.0f} min")
+                st.metric("Distance", f"{route['distance'] / 1000:.1f} km")
+        st.info(
+            f"Recommended: Route {best_index + 1}, selected for the {result['optimize'].lower()}. "
+            "The current model is trained on one historical I-94 traffic sensor and does not score congestion separately on each road segment."
         )
+        st.caption("Map data © OpenStreetMap contributors. Route geometry and baseline estimates provided by the OSRM demo service.")
 
-        st.success("Model comparison results loaded!")
+with forecast_tab:
+    st.subheader("Forecast traffic on the I-94 training corridor")
+    st.write("Choose a historical observation from the Metro Interstate Traffic Volume dataset. The trained models use the previous 24 continuous hourly records to forecast the following hour.")
+    if not DATA_FILE.exists():
+        st.error("The processed traffic dataset is missing. Run the data preparation scripts first.")
+    else:
+        df = load_traffic_data()
+        min_day = df["date_time"].min().date()
+        max_day = df["date_time"].max().date()
+        chosen_day = st.date_input("Historical reference date", value=max_day, min_value=min_day, max_value=max_day)
+        day_rows = df[df["date_time"].dt.date == chosen_day]
+        if day_rows.empty:
+            st.warning("No observations exist for that date.")
+        else:
+            options = day_rows["date_time"].dt.strftime("%H:%M").tolist()
+            chosen_clock = st.selectbox("Last observed time", options, index=len(options) - 1)
+            selected_time = pd.Timestamp(f"{chosen_day} {chosen_clock}")
+            if st.button("Run all three AI models", type="primary"):
+                try:
+                    with st.spinner("Loading trained models and forecasting..."):
+                        models = load_models()
+                        forecasts = predict_historical_snapshot(df, selected_time, models)
+                    st.session_state["forecast_result"] = forecasts
+                except Exception as exc:
+                    st.error(f"Forecast could not be generated: {exc}")
 
-        # Display comparison table
-        st.subheader("Performance Metrics")
+        forecast = st.session_state.get("forecast_result")
+        if forecast:
+            st.caption(f"Forecast target: {forecast['forecast_time']:%d %b %Y, %H:%M} (historical dataset time)")
+            a, b, c = st.columns(3)
+            for col, model_name in zip([a, b, c], ["Original LSTM", "Multivariate LSTM", "Transformer"]):
+                with col:
+                    st.metric(model_name, f"{forecast[model_name]:,.0f} vehicles/hour")
+            avg = float(np.mean([forecast["Original LSTM"], forecast["Multivariate LSTM"], forecast["Transformer"]]))
+            st.metric("Ensemble mean (informational)", f"{avg:,.0f} vehicles/hour")
+            st.metric("Last observed traffic", f"{forecast['observed']:,.0f} vehicles/hour")
+            st.info("These forecasts are historical I-94 model demonstrations, not current traffic conditions and not predictions for the route selected in the map.")
+            with st.expander("What makes the models different?"):
+                st.write("- Original LSTM: uses the previous 24 traffic-volume observations.")
+                st.write("- Multivariate LSTM: uses traffic, weather and time-related features.")
+                st.write("- Transformer: uses the same multivariate inputs with attention layers.")
 
-        st.dataframe(
-            comparison.round(4),
-            use_container_width=True,
-            hide_index=True
-        )
-
-        st.divider()
-
-        # Display individual metrics
-        st.subheader("Metric Comparison")
-
-        metric_choice = st.selectbox(
-            "Select Evaluation Metric",
-            ["MAE", "RMSE", "R2"]
-        )
-
-        chart_data = comparison.set_index("Model")[
-            [metric_choice]
-        ]
-
-        st.bar_chart(chart_data)
-
-        # Explain metrics
-        explanations = {
-            "MAE": "Average absolute difference between actual and predicted traffic volume. Lower is better.",
-            "RMSE": "Penalizes larger prediction errors more heavily. Lower is better.",
-            "R2": "Measures how much variation in traffic volume is explained by the model. Higher is better."
-        }
-
-        st.info(explanations[metric_choice])
-
-        st.divider()
-
-        # Display all three metric graphs
-        st.subheader("Complete Model Performance")
-
-        st.image(
-            "models/three_model_metrics.png",
-            caption="Comparison of MAE, RMSE and R² across all models",
-            use_container_width=True
-        )
-
-        st.subheader("Actual vs Predicted Traffic")
-
-        st.image(
-            "models/three_model_predictions.png",
-            caption="Actual traffic compared with all three model predictions",
-            use_container_width=True
-        )
-
-    except FileNotFoundError:
-        st.error(
-            "Comparison files not found. "
-            "Please run python src/compare_all_models.py first."
-        )
-
-
-    st.header("Model Performance Comparison")
-
-    st.write("""
-    Three deep learning architectures were trained and evaluated:
-    - Original LSTM
-    - Multivariate LSTM
-    - Transformer
-    """)
-
-    st.info(
-        "We will load the actual comparison results and graphs in the next step."
-    )
-
-# About Project page
-
-elif page == "About Project":
-
-    st.header("About the Project")
-
+with about_tab:
+    st.subheader("Project scope and data transparency")
     st.markdown("""
-    ## 🚦 Traffic Congestion Prediction System
+    **IntelliRoute AI** combines two working capabilities:
 
-    An AI-powered system that uses historical traffic and
-    weather information to predict traffic volume for the
-    next hour using deep learning.
+    1. **Route planning:** geocodes places, draws road routes and compares available alternatives using OpenStreetMap-based services.
+    2. **Deep-learning forecast:** runs the three trained models on a selected historical I-94 observation window.
+
+    **Training data:** Metro Interstate Traffic Volume, westbound I-94 in the Minneapolis–St. Paul area, 2012–2018.
+
+    **Important limitation:** the training data represents one traffic sensor/time series. It does not contain road-segment IDs or traffic measurements for every road. Therefore the AI forecast is shown separately and is not falsely presented as live, route-specific congestion. Route durations are baseline routing estimates from OSRM.
     """)
-
-    st.divider()
-
-    # Project objective
-    st.subheader("🎯 Project Objective")
-
-    st.write("""
-    The objective is to analyze historical traffic patterns
-    and develop deep learning models capable of predicting
-    future traffic volume.
-    """)
-
-    # Dataset information
-    st.subheader("📊 Dataset Information")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.metric("Total Records", "40,575")
-        st.metric("Input Features", "24")
-
-    with col2:
-        st.metric("Dataset Period", "2012–2018")
-        st.metric("Prediction Horizon", "1 Hour")
-
-    st.info("""
-    Dataset: Metro Interstate Traffic Volume.
-
-    Location: Westbound I-94, Minneapolis–St. Paul, USA.
-
-    This project currently uses historical data, not live
-    traffic feeds.
-    """)
-
-    st.divider()
-
-    # Models
-    st.subheader("🧠 Deep Learning Models")
-
-    st.markdown("""
-    **1. Original LSTM**
-    - Uses historical traffic volume.
-    - Learns sequential traffic patterns.
-
-    **2. Multivariate LSTM**
-    - Uses traffic, weather and time-related features.
-    - Learns relationships between multiple variables.
-
-    **3. Transformer**
-    - Uses positional encoding and self-attention.
-    - Learns relationships across historical time steps.
-    """)
-
-    st.divider()
-
-    # Technologies
-    st.subheader("🛠️ Technologies Used")
-
-    technologies = [
-        "Python",
-        "Pandas",
-        "NumPy",
-        "Scikit-learn",
-        "TensorFlow / Keras",
-        "LSTM Neural Networks",
-        "Transformer Architecture",
-        "Matplotlib",
-        "Streamlit"
-    ]
-
-    st.write(" | ".join(technologies))
-
-    st.divider()
-
-    # Workflow
-    st.subheader("⚙️ Project Workflow")
-
-    st.markdown("""
-    1. Historical traffic dataset collection.
-    2. Data exploration and analysis.
-    3. Data cleaning and preprocessing.
-    4. Time-series sequence preparation.
-    5. Deep learning model training.
-    6. Model evaluation and comparison.
-    7. Traffic prediction dashboard development.
-    """)
-
-    st.divider()
-
-    st.caption(
-        "Traffic Congestion Prediction System | "
-        "AI & Data Science Project"
-    )
-
-
-    st.header("About the Project")
-
-    st.write("""
-    **Traffic Congestion Prediction System**
-
-    This project uses historical traffic and weather information
-    to predict next-hour traffic volume.
-
-    Technologies used:
-
-    - Python
-    - Pandas and NumPy
-    - TensorFlow / Keras
-    - LSTM
-    - Transformer
-    - Scikit-learn
-    - Streamlit
-    """)
+    st.markdown("**Models:** Original LSTM · Multivariate LSTM · Transformer")
+    st.markdown("**Stack:** Python · Streamlit · TensorFlow/Keras · Pandas · Folium · OpenStreetMap · OSRM")
+    st.caption("Academic prototype — not a live navigation or emergency-routing service.")
