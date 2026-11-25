@@ -1,14 +1,12 @@
 """Train and evaluate Bengaluru next-day traffic prediction models.
 
 Models use previous-day observations and known calendar features to predict
-next-day congestion and traffic volume. The split is chronological.
+next-day congestion and traffic volume. Splits are chronological by target date.
 """
 from pathlib import Path
 import json
-import warnings
 
 import joblib
-import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import ExtraTreesRegressor, GradientBoostingRegressor, RandomForestRegressor
@@ -16,8 +14,6 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
-
-warnings.filterwarnings("ignore", category=UserWarning)
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_FILE = ROOT / "data" / "processed" / "bangalore_next_day_training.csv"
@@ -78,6 +74,13 @@ def model_candidates():
         ),
     }
 
+def regression_metrics(actual, predicted):
+    return {
+        "mae": float(mean_absolute_error(actual, predicted)),
+        "rmse": float(mean_squared_error(actual, predicted) ** 0.5),
+        "r2": float(r2_score(actual, predicted)),
+    }
+
 def main():
     if not DATA_FILE.exists():
         raise FileNotFoundError(
@@ -86,95 +89,118 @@ def main():
         )
 
     df = pd.read_csv(DATA_FILE, parse_dates=["Date", "Target Date"])
-    df = df.sort_values("Target Date").reset_index(drop=True)
+    df = df.sort_values(["Target Date", "Previous Day - Road/Intersection Name"]).reset_index(drop=True)
     if len(df) < 100:
         raise ValueError(f"Only {len(df)} training examples found; refusing to train.")
 
-    # Hold out the latest 20% of target dates. No random shuffling.
-    split_at = int(len(df) * 0.8)
-    train_df = df.iloc[:split_at].copy()
-    test_df = df.iloc[split_at:].copy()
-    if train_df["Target Date"].max() >= test_df["Target Date"].min():
-        raise ValueError("Chronological split is not strictly separated by date.")
+    # Split on unique dates so records from the same target day cannot leak
+    # across train, validation, and test partitions.
+    unique_dates = pd.Index(sorted(df["Target Date"].dropna().unique()))
+    if len(unique_dates) < 20:
+        raise ValueError("Not enough distinct target dates for chronological evaluation.")
+    train_end = unique_dates[int(len(unique_dates) * 0.70)]
+    validation_end = unique_dates[int(len(unique_dates) * 0.85)]
+
+    train_df = df[df["Target Date"] < train_end].copy()
+    validation_df = df[
+        (df["Target Date"] >= train_end) & (df["Target Date"] < validation_end)
+    ].copy()
+    test_df = df[df["Target Date"] >= validation_end].copy()
+
+    if min(len(train_df), len(validation_df), len(test_df)) == 0:
+        raise ValueError("A chronological split is empty; inspect the date coverage.")
 
     X_train = train_df[FEATURES]
+    X_validation = validation_df[FEATURES]
     X_test = test_df[FEATURES]
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     METRICS_FILE.parent.mkdir(parents=True, exist_ok=True)
     all_metrics = {
         "dataset": str(DATA_FILE.relative_to(ROOT)),
-        "training_examples": int(len(train_df)),
-        "testing_examples": int(len(test_df)),
-        "train_target_date_range": [
-            str(train_df["Target Date"].min().date()),
-            str(train_df["Target Date"].max().date()),
-        ],
-        "test_target_date_range": [
-            str(test_df["Target Date"].min().date()),
-            str(test_df["Target Date"].max().date()),
-        ],
+        "examples": {
+            "train": int(len(train_df)),
+            "validation": int(len(validation_df)),
+            "test": int(len(test_df)),
+        },
+        "target_date_ranges": {
+            "train": [str(train_df["Target Date"].min().date()), str(train_df["Target Date"].max().date())],
+            "validation": [str(validation_df["Target Date"].min().date()), str(validation_df["Target Date"].max().date())],
+            "test": [str(test_df["Target Date"].min().date()), str(test_df["Target Date"].max().date())],
+        },
         "prediction_scope": "next calendar day, using previous calendar day's observed features",
         "targets": {},
     }
 
     for target_key, target_column in TARGETS.items():
         y_train = train_df[target_column].astype(float)
+        y_validation = validation_df[target_column].astype(float)
         y_test = test_df[target_column].astype(float)
-        results = []
 
+        candidates = []
         for model_name, estimator in model_candidates().items():
-            pipeline = Pipeline([
+            candidate = Pipeline([
                 ("preprocessor", make_preprocessor()),
                 ("model", estimator),
             ])
-            pipeline.fit(X_train, y_train)
-            predictions = pipeline.predict(X_test)
-            rmse = float(np.sqrt(mean_squared_error(y_test, predictions)))
-            metrics = {
-                "model": model_name,
-                "mae": float(mean_absolute_error(y_test, predictions)),
-                "rmse": rmse,
-                "r2": float(r2_score(y_test, predictions)),
-            }
-            results.append((metrics, pipeline))
+            candidate.fit(X_train, y_train)
+            validation_prediction = candidate.predict(X_validation)
+            validation_score = regression_metrics(y_validation, validation_prediction)
+            candidates.append((validation_score["mae"], model_name, estimator, validation_score))
             print(
                 f"{target_key:14s} | {model_name:18s} | "
-                f"MAE {metrics['mae']:.3f} | RMSE {rmse:.3f} | R2 {metrics['r2']:.4f}"
+                f"validation MAE {validation_score['mae']:.3f} | "
+                f"RMSE {validation_score['rmse']:.3f} | R2 {validation_score['r2']:.4f}"
             )
 
-        # Select using lowest MAE on the held-out chronological test set.
-        # This is a first baseline; later we can add a separate validation period.
-        results.sort(key=lambda item: item[0]["mae"])
-        best_metrics, best_pipeline = results[0]
+        # Select on validation only, then refit on train + validation.
+        candidates.sort(key=lambda item: item[0])
+        _, best_name, best_estimator, best_validation_metrics = candidates[0]
+        fit_df = pd.concat([train_df, validation_df], ignore_index=True)
+        final_pipeline = Pipeline([
+            ("preprocessor", make_preprocessor()),
+            ("model", best_estimator),
+        ])
+        final_pipeline.fit(fit_df[FEATURES], fit_df[target_column].astype(float))
+
+        test_prediction = final_pipeline.predict(X_test)
+        test_metrics = regression_metrics(y_test, test_prediction)
         model_path = MODEL_DIR / f"bangalore_{target_key}_model.joblib"
-        joblib.dump(best_pipeline, model_path)
+        joblib.dump(final_pipeline, model_path)
 
-        all_metrics["targets"][target_key] = {
-            "best_model": best_metrics["model"],
-            "best_model_path": str(model_path.relative_to(ROOT)),
-            "model_comparison": [item[0] for item in results],
-        }
-
-        # Road-wise diagnostics for the selected model.
         road_results = test_df[["Previous Day - Road/Intersection Name"]].copy()
         road_results["actual"] = y_test.to_numpy()
-        road_results["predicted"] = best_pipeline.predict(X_test)
+        road_results["predicted"] = test_prediction
         road_metrics = {}
         for road, group in road_results.groupby("Previous Day - Road/Intersection Name"):
             road_metrics[str(road)] = {
                 "records": int(len(group)),
                 "mae": float(mean_absolute_error(group["actual"], group["predicted"])),
             }
-        all_metrics["targets"][target_key]["road_wise_mae"] = road_metrics
+
+        all_metrics["targets"][target_key] = {
+            "selected_model": best_name,
+            "validation_metrics": best_validation_metrics,
+            "test_metrics": test_metrics,
+            "model_path": str(model_path.relative_to(ROOT)),
+            "validation_model_comparison": [
+                {"model": name, **score}
+                for _, name, _, score in candidates
+            ],
+            "road_wise_test_mae": road_metrics,
+        }
+        print(
+            f"  FINAL TEST | {target_key:14s} | "
+            f"MAE {test_metrics['mae']:.3f} | "
+            f"RMSE {test_metrics['rmse']:.3f} | R2 {test_metrics['r2']:.4f}"
+        )
 
     with open(METRICS_FILE, "w", encoding="utf-8") as f:
         json.dump(all_metrics, f, indent=2)
 
     print(f"\nSaved model metrics: {METRICS_FILE}")
     print(f"Saved models in: {MODEL_DIR}")
-    print("\nImportant: test metrics are a first chronological benchmark. "
-          "Do not describe these predictions as live traffic.")
+    print("\nImportant: these are next-day predictions from historical data, not live traffic.")
 
 if __name__ == "__main__":
     main()
