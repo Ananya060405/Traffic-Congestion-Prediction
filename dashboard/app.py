@@ -7,6 +7,7 @@ import streamlit as st
 import tensorflow as tf
 import joblib
 import folium
+import matplotlib.pyplot as plt
 from streamlit_folium import st_folium
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -142,7 +143,7 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-route_tab, forecast_tab, about_tab = st.tabs(["🗺️ Smart Route Planner", "🧠 AI Traffic Forecast", "ℹ️ About"])
+route_tab, forecast_tab, insights_tab, about_tab = st.tabs(["🗺️ Smart Route Planner", "🧠 AI Traffic Forecast", "📊 Historical Insights", "ℹ️ About"])
 
 with route_tab:
     st.subheader("Plan a journey")
@@ -151,7 +152,8 @@ with route_tab:
         origin_text = st.text_input("Starting point", placeholder="e.g. Mall of America, Bloomington, Minnesota")
     with right:
         destination_text = st.text_input("Destination", placeholder="e.g. Target Field, Minneapolis, Minnesota")
-    optimize = st.radio("Recommend route based on", ["Fastest journey", "Shortest distance"], horizontal=True)
+    optimize = st.radio("Recommendation strategy", ["Balanced recommendation", "Fastest journey", "Shortest distance"], horizontal=True)
+    time_priority = st.slider("Travel-time priority for balanced scoring", 0, 100, 70, 5, help="The remaining weight is assigned to shorter distance. This compares routing-service estimates, not live congestion.")
     plan = st.button("Find routes", type="primary", use_container_width=False)
 
     if plan:
@@ -167,7 +169,7 @@ with route_tab:
                     routes = get_routes(origin["lon"], origin["lat"], destination["lon"], destination["lat"])
                 st.session_state["route_result"] = {
                     "origin": origin, "destination": destination, "routes": routes,
-                    "optimize": optimize,
+                    "optimize": optimize, "time_priority": time_priority,
                 }
             except Exception as exc:
                 st.error(f"Unable to calculate routes: {exc}")
@@ -175,10 +177,25 @@ with route_tab:
     result = st.session_state.get("route_result")
     if result:
         routes = result["routes"]
-        best_index = min(
-            range(len(routes)),
-            key=lambda i: routes[i]["duration"] if result["optimize"] == "Fastest journey" else routes[i]["distance"],
-        )
+        durations = np.array([route["duration"] for route in routes], dtype=float)
+        distances = np.array([route["distance"] for route in routes], dtype=float)
+
+        def normalized(values):
+            span = float(values.max() - values.min())
+            return np.zeros_like(values) if span == 0 else (values - values.min()) / span
+
+        if result["optimize"] == "Fastest journey":
+            route_costs = normalized(durations)
+            score_labels = "fastest"
+        elif result["optimize"] == "Shortest distance":
+            route_costs = normalized(distances)
+            score_labels = "shortest"
+        else:
+            weight_time = result["time_priority"] / 100
+            route_costs = weight_time * normalized(durations) + (1 - weight_time) * normalized(distances)
+            score_labels = "balanced"
+        route_scores = 100 * (1 - route_costs)
+        best_index = int(np.argmax(route_scores))
         colors = ["#087f5b", "#2563eb", "#d97706", "#7c3aed"]
         center = [
             (result["origin"]["lat"] + result["destination"]["lat"]) / 2,
@@ -216,9 +233,10 @@ with route_tab:
                     st.success("Recommended")
                 st.metric("Estimated driving time", f"{route['duration'] / 60:.0f} min")
                 st.metric("Distance", f"{route['distance'] / 1000:.1f} km")
+                st.metric("Relative route score", f"{route_scores[i]:.0f}/100")
         st.info(
-            f"Recommended: Route {best_index + 1}, selected for the {result['optimize'].lower()}. "
-            "The current model is trained on one historical I-94 traffic sensor and does not score congestion separately on each road segment."
+            f"Recommended: Route {best_index + 1}. It has the strongest relative {score_labels} score among the alternatives returned. "
+            "Scores compare OSRM baseline duration and distance only; they are not AI-predicted or live-traffic congestion scores."
         )
         st.caption("Map data © OpenStreetMap contributors. Route geometry and baseline estimates provided by the OSRM demo service.")
 
@@ -258,11 +276,71 @@ with forecast_tab:
             avg = float(np.mean([forecast["Original LSTM"], forecast["Multivariate LSTM"], forecast["Transformer"]]))
             st.metric("Ensemble mean (informational)", f"{avg:,.0f} vehicles/hour")
             st.metric("Last observed traffic", f"{forecast['observed']:,.0f} vehicles/hour")
+            predictions = [forecast["Original LSTM"], forecast["Multivariate LSTM"], forecast["Transformer"]]
+            model_spread = max(predictions) - min(predictions)
+            mean_prediction = float(np.mean(predictions))
+            spread_pct = (model_spread / mean_prediction * 100) if mean_prediction else 0.0
+            st.metric("Model disagreement (max − min)", f"{model_spread:,.0f} vehicles/hour", f"{spread_pct:.1f}% of ensemble mean")
+            st.caption("Model disagreement is a comparison between model outputs, not a calibrated confidence interval.")
+
+            history_end = df.index[df["date_time"] == pd.Timestamp(selected_time)].tolist()
+            if history_end:
+                recent = df.iloc[max(0, history_end[0] - 23):history_end[0] + 1][["date_time", "traffic_volume"]]
+                fig, ax = plt.subplots(figsize=(10, 3.5))
+                ax.plot(recent["date_time"], recent["traffic_volume"], marker="o", label="Observed history")
+                ax.scatter([forecast["forecast_time"]], [mean_prediction], marker="*", s=180, label="Three-model mean forecast")
+                ax.set_title("Previous observations and next-hour model forecast")
+                ax.set_ylabel("Vehicles per hour")
+                ax.set_xlabel("Historical dataset time")
+                ax.grid(alpha=0.25)
+                ax.legend()
+                fig.autofmt_xdate()
+                st.pyplot(fig, use_container_width=True)
+                plt.close(fig)
+
             st.info("These forecasts are historical I-94 model demonstrations, not current traffic conditions and not predictions for the route selected in the map.")
-            with st.expander("What makes the models different?"):
+            with st.expander("What makes the models different?")
                 st.write("- Original LSTM: uses the previous 24 traffic-volume observations.")
                 st.write("- Multivariate LSTM: uses traffic, weather and time-related features.")
                 st.write("- Transformer: uses the same multivariate inputs with attention layers.")
+
+with insights_tab:
+    st.subheader("Historical I-94 congestion patterns")
+    st.write("Explore how recorded traffic volume varied by hour and day of week in the training dataset. Categories are based on this dataset's own traffic-volume quartiles; these are historical patterns, not live road conditions.")
+    if DATA_FILE.exists():
+        insight_df = load_traffic_data().copy()
+        insight_df["day_name"] = insight_df["date_time"].dt.day_name()
+        insight_df["hour_of_day"] = insight_df["date_time"].dt.hour
+        day_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        heat = insight_df.pivot_table(index="day_name", columns="hour_of_day", values="traffic_volume", aggfunc="mean").reindex(day_order)
+        q1, q2, q3 = insight_df["traffic_volume"].quantile([0.25, 0.50, 0.75]).tolist()
+        fig, ax = plt.subplots(figsize=(12, 4.5))
+        image = ax.imshow(heat.to_numpy(), aspect="auto", interpolation="nearest", cmap="YlOrRd")
+        ax.set_yticks(range(len(heat.index)), labels=[d[:3] for d in heat.index])
+        ax.set_xticks(range(len(heat.columns)), labels=[str(int(h)) for h in heat.columns])
+        ax.set_xlabel("Hour of day")
+        ax.set_ylabel("Day of week")
+        ax.set_title("Average historical traffic volume (vehicles/hour)")
+        colorbar = fig.colorbar(image, ax=ax)
+        colorbar.set_label("Vehicles per hour")
+        fig.tight_layout()
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
+
+        peak = heat.stack().idxmax()
+        peak_value = float(heat.stack().max())
+        avg_by_hour = insight_df.groupby("hour_of_day")["traffic_volume"].mean()
+        peak_hour = int(avg_by_hour.idxmax())
+        a, b, c = st.columns(3)
+        a.metric("Busiest average hour", f"{peak_hour:02d}:00")
+        b.metric("Busiest day/hour cell", f"{peak[0]}, {int(peak[1]):02d}:00")
+        c.metric("Peak cell average", f"{peak_value:,.0f} vehicles/hour")
+        st.caption(f"Dataset-specific traffic-volume bands: Low ≤ {q1:,.0f}; Moderate ≤ {q2:,.0f}; High ≤ {q3:,.0f}; Severe > {q3:,.0f} vehicles/hour.")
+        st.markdown("#### Average traffic by hour")
+        st.line_chart(avg_by_hour)
+        st.warning("This is a temporal heatmap for the single westbound I-94 sensor. It cannot be overlaid as a geographic congestion heatmap on arbitrary routes without road-segment traffic measurements.")
+    else:
+        st.error("The processed traffic dataset is missing.")
 
 with about_tab:
     st.subheader("Project scope and data transparency")
