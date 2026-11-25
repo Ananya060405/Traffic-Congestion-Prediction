@@ -5,7 +5,9 @@ An academic prototype combining interactive route alternatives with deep-learnin
 ## Features
 
 - Enter an origin and destination and view road routes on an interactive map.
-- Compare alternative routes by baseline duration and distance.
+- Compare alternative routes by baseline duration and distance, with a transparent relative score and adjustable time-versus-distance preference.
+- Explore a historical day-of-week versus hour heatmap for the I-94 traffic sensor.
+- Compare the three model outputs, inspect their disagreement, and view recent observations alongside the next-hour forecast.
 - Select a historical observation and forecast the following hour using three trained models: Original LSTM, Multivariate LSTM, and Transformer.
 - Display model outputs separately and explain the data limitations.
 
@@ -48,6 +50,9 @@ python src/prepare_multivariate_data.py
 ## Important limitations
 
 - No live traffic feed is connected.
+- The historical heatmap is temporal analysis of one I-94 sensor, not a geographic congestion layer for all roads.
+- Route scores compare OSRM baseline duration and distance only; they are not AI-learned or live-traffic congestion scores.
+- Model disagreement is a simple diagnostic, not a calibrated confidence interval.
 - Route durations are baseline estimates from the routing service.
 - AI forecasts are historical I-94 corridor demonstrations, not current conditions.
 - Congestion levels based on model outputs should not be interpreted as official road-capacity classifications.
