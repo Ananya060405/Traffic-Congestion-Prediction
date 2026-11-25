@@ -283,7 +283,8 @@ with forecast_tab:
             st.metric("Model disagreement (max − min)", f"{model_spread:,.0f} vehicles/hour", f"{spread_pct:.1f}% of ensemble mean")
             st.caption("Model disagreement is a comparison between model outputs, not a calibrated confidence interval.")
 
-            history_end = df.index[df["date_time"] == pd.Timestamp(selected_time)].tolist()
+            reference_time = forecast["forecast_time"] - pd.Timedelta(hours=1)
+            history_end = df.index[df["date_time"] == reference_time].tolist()
             if history_end:
                 recent = df.iloc[max(0, history_end[0] - 23):history_end[0] + 1][["date_time", "traffic_volume"]]
                 fig, ax = plt.subplots(figsize=(10, 3.5))
