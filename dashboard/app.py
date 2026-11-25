@@ -300,7 +300,7 @@ with forecast_tab:
                 plt.close(fig)
 
             st.info("These forecasts are historical I-94 model demonstrations, not current traffic conditions and not predictions for the route selected in the map.")
-            with st.expander("What makes the models different?")
+            with st.expander("What makes the models different?"):
                 st.write("- Original LSTM: uses the previous 24 traffic-volume observations.")
                 st.write("- Multivariate LSTM: uses traffic, weather and time-related features.")
                 st.write("- Transformer: uses the same multivariate inputs with attention layers.")
